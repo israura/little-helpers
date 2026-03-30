@@ -12,7 +12,6 @@
 #                            Options: "Run Sanity Tests", "Run Sanity Tests MSP",
 #                                     "Run Smoke Tests", "Run Sanity Tests Flanders"
 #   -c, --config <file>      Cypress config file path (auto-detected from workflow if using --latest)
-#   -e, --env <environment>  Cypress WORKSPACE env override (e.g. qa2.test, stag)
 #   -d, --dry-run            Print the command without running it
 #   -h, --help               Show this help message
 #
@@ -36,7 +35,6 @@ RUN_ID=""
 USE_LATEST=false
 WORKFLOW_NAME="Run Sanity Tests"
 CONFIG_FILE=""
-WORKSPACE_ENV=""
 DRY_RUN=false
 
 # ── workflow → config file mapping ────────────────────────────────────────────
@@ -66,7 +64,6 @@ usage() {
   print -- "                           Options: \"Run Sanity Tests\", \"Run Sanity Tests MSP\","
   print -- "                                    \"Run Smoke Tests\", \"Run Sanity Tests Flanders\""
   print -- "  -c, --config <file>      Cypress config file (auto-detected if using --latest)"
-  print -- "  -e, --env <environment>  WORKSPACE env override (e.g. qa2.test, stag)"
   print -- "  -d, --dry-run            Print the command without running it"
   print -- "  -h, --help               Show this help message"
   print -- ""
@@ -89,7 +86,6 @@ while [[ $# -gt 0 ]]; do
     -l|--latest)    USE_LATEST=true;      shift   ;;
     -w|--workflow)  WORKFLOW_NAME="$2";   shift 2 ;;
     -c|--config)    CONFIG_FILE="$2";     shift 2 ;;
-    -e|--env)       WORKSPACE_ENV="$2";   shift 2 ;;
     -d|--dry-run)   DRY_RUN=true;         shift   ;;
     -h|--help)      usage ;;
     *) echo "Unknown option: $1" >&2; usage ;;
@@ -210,9 +206,6 @@ SPEC_ARG="${(j:,:)FAILED_SPECS}"
 
 # ── build command as an array (avoids all eval/quoting issues) ────────────────
 CMD_DISPLAY="npx cypress run --config-file ${CONFIG_FILE} --spec \"${SPEC_ARG}\""
-if [[ -n "$WORKSPACE_ENV" ]]; then
-  CMD_DISPLAY="WORKSPACE=${WORKSPACE_ENV} ${CMD_DISPLAY}"
-fi
 
 echo "🚀 Command to re-run failed tests:"
 echo ""
@@ -232,11 +225,11 @@ echo "────────────────────────�
 
 # Build as a real array so no eval/re-quoting occurs.
 # --spec receives exactly one value: "path1,path2,path3" — which is what Cypress expects.
-local -a RUN_CMD=(npx cypress run --config-file "${CONFIG_FILE}" --spec "${SPEC_ARG}")
+local -a RUN_CMD=(npx cypress run --spec "${SPEC_ARG}" --config-file "${CONFIG_FILE}")
 
-if [[ -n "$WORKSPACE_ENV" ]]; then
-  WORKSPACE="${WORKSPACE_ENV}" "${RUN_CMD[@]}"
-else
+if [[ -n "RUN_CMD" ]]; then
   "${RUN_CMD[@]}"
+else
+  echo "No command to run"
 fi
 
