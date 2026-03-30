@@ -1,0 +1,242 @@
+#!/usr/bin/env zsh
+# cypress-rerun-failed
+# Fetches failed spec files from a GitHub Actions workflow run and re-runs them locally.
+#
+# Usage:
+#   cypress-rerun-failed [OPTIONS]
+#
+# Options:
+#   -r, --run-id <id>        GitHub Actions run ID (required, or use --latest)
+#   -l, --latest             Use the most recent failed run for the given workflow
+#   -w, --workflow <name>    Workflow name to search (default: "Run Sanity Tests")
+#                            Options: "Run Sanity Tests", "Run Sanity Tests MSP",
+#                                     "Run Smoke Tests", "Run Sanity Tests Flanders"
+#   -c, --config <file>      Cypress config file path (auto-detected from workflow if using --latest)
+#   -e, --env <environment>  Cypress WORKSPACE env override (e.g. qa2.test, stag)
+#   -d, --dry-run            Print the command without running it
+#   -h, --help               Show this help message
+#
+# Examples:
+#   # Re-run failed tests from the latest failed MSP sanity run
+#   cypress-rerun-failed --latest --workflow "Run Sanity Tests MSP"
+#
+#   # Re-run failed tests from a specific run ID
+#   cypress-rerun-failed --run-id 23744474180 --config config/sanity-test/cypress.config.test.ts
+#
+#   # Dry run to see the command first
+#   cypress-rerun-failed --latest --dry-run
+
+set -euo pipefail
+
+REPO="isubscribed/dr-martin-brenner"
+PROJECT_ROOT="/Users/israel.haigler/Projects/dr-martin-brenner"
+
+# ── defaults ──────────────────────────────────────────────────────────────────
+RUN_ID=""
+USE_LATEST=false
+WORKFLOW_NAME="Run Sanity Tests"
+CONFIG_FILE=""
+WORKSPACE_ENV=""
+DRY_RUN=false
+
+# ── workflow → config file mapping ────────────────────────────────────────────
+declare -A WORKFLOW_CONFIG_MAP
+WORKFLOW_CONFIG_MAP["Run Sanity Tests"]="config/sanity-test/cypress.config.test.ts"
+WORKFLOW_CONFIG_MAP["Run Sanity Tests MSP"]="config/sanity-test/cypress.config.msp.test.ts"
+WORKFLOW_CONFIG_MAP["Run Smoke Tests"]="config/smoke-test/cypress.config.test.ts"
+WORKFLOW_CONFIG_MAP["Run Sanity Tests Flanders"]="config/sanity-test/cypress.config.flanders.test.ts"
+
+# ── workflow → spec root mapping ──────────────────────────────────────────────
+declare -A WORKFLOW_SPEC_ROOT
+WORKFLOW_SPEC_ROOT["Run Sanity Tests"]="cypress/sanity-test/e2e"
+WORKFLOW_SPEC_ROOT["Run Sanity Tests MSP"]="cypress/sanity-test/e2e-msp"
+WORKFLOW_SPEC_ROOT["Run Smoke Tests"]="cypress/smoke-test/e2e"
+WORKFLOW_SPEC_ROOT["Run Sanity Tests Flanders"]="cypress/sanity-test/e2e-flanders"
+
+# ── help ──────────────────────────────────────────────────────────────────────
+usage() {
+  print -- "cypress-rerun-failed - Re-run failed Cypress tests from a GitHub Actions run"
+  print -- ""
+  print -- "Usage: cypress-rerun-failed [OPTIONS]"
+  print -- ""
+  print -- "Options:"
+  print -- "  -r, --run-id <id>        GitHub Actions run ID"
+  print -- "  -l, --latest             Use the most recent failed run for the given workflow"
+  print -- "  -w, --workflow <name>    Workflow name (default: \"Run Sanity Tests\")"
+  print -- "                           Options: \"Run Sanity Tests\", \"Run Sanity Tests MSP\","
+  print -- "                                    \"Run Smoke Tests\", \"Run Sanity Tests Flanders\""
+  print -- "  -c, --config <file>      Cypress config file (auto-detected if using --latest)"
+  print -- "  -e, --env <environment>  WORKSPACE env override (e.g. qa2.test, stag)"
+  print -- "  -d, --dry-run            Print the command without running it"
+  print -- "  -h, --help               Show this help message"
+  print -- ""
+  print -- "Examples:"
+  print -- "  # Re-run failed tests from the latest failed MSP sanity run"
+  print -- "  cypress-rerun-failed --latest --workflow \"Run Sanity Tests MSP\""
+  print -- ""
+  print -- "  # Re-run failed tests from a specific run ID"
+  print -- "  cypress-rerun-failed --run-id 23744474180 --config config/sanity-test/cypress.config.test.ts"
+  print -- ""
+  print -- "  # Dry run to preview the command first"
+  print -- "  cypress-rerun-failed --latest --dry-run"
+  exit 0
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--run-id)    RUN_ID="$2";         shift 2 ;;
+    -l|--latest)    USE_LATEST=true;      shift   ;;
+    -w|--workflow)  WORKFLOW_NAME="$2";   shift 2 ;;
+    -c|--config)    CONFIG_FILE="$2";     shift 2 ;;
+    -e|--env)       WORKSPACE_ENV="$2";   shift 2 ;;
+    -d|--dry-run)   DRY_RUN=true;         shift   ;;
+    -h|--help)      usage ;;
+    *) echo "Unknown option: $1" >&2; usage ;;
+  esac
+done
+
+# ── validate gh auth ──────────────────────────────────────────────────────────
+if ! gh auth status &>/dev/null; then
+  echo "❌ Not authenticated with GitHub CLI. Run: gh auth login" >&2
+  exit 1
+fi
+
+# ── resolve run ID ────────────────────────────────────────────────────────────
+if [[ "$USE_LATEST" == true ]]; then
+  echo "🔍 Finding latest failed run for workflow: \"$WORKFLOW_NAME\"..."
+  RUN_ID=$(gh api "repos/${REPO}/actions/runs" \
+    --jq ".workflow_runs[] | select(.name == \"${WORKFLOW_NAME}\" and .conclusion == \"failure\") | .id" \
+    2>/dev/null | head -1)
+
+  if [[ -z "$RUN_ID" ]]; then
+    echo "❌ No failed runs found for workflow: \"$WORKFLOW_NAME\"" >&2
+    exit 1
+  fi
+  echo "✅ Found run ID: $RUN_ID"
+fi
+
+if [[ -z "$RUN_ID" ]]; then
+  echo "❌ No run ID specified. Use --run-id <id> or --latest" >&2
+  usage
+fi
+
+# ── auto-detect config file from workflow name ────────────────────────────────
+if [[ -z "$CONFIG_FILE" ]]; then
+  # Try to detect workflow name from the run if not using --latest
+  if [[ "$USE_LATEST" == false ]]; then
+    DETECTED_WORKFLOW=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" \
+      --jq '.name' 2>/dev/null || echo "")
+    if [[ -n "$DETECTED_WORKFLOW" ]]; then
+      WORKFLOW_NAME="$DETECTED_WORKFLOW"
+    fi
+  fi
+
+  CONFIG_FILE="${WORKFLOW_CONFIG_MAP["$WORKFLOW_NAME"]:-}"
+  if [[ -z "$CONFIG_FILE" ]]; then
+    echo "⚠️  Could not auto-detect config for workflow: \"$WORKFLOW_NAME\"" >&2
+    echo "   Known workflows:" >&2
+    for k in "${(@k)WORKFLOW_CONFIG_MAP}"; do echo "     • \"$k\""; done >&2
+    echo "   Use --config to specify manually." >&2
+    exit 1
+  fi
+  echo "📋 Using config: $CONFIG_FILE"
+fi
+
+# ── get spec root for this workflow ──────────────────────────────────────────
+SPEC_ROOT="${WORKFLOW_SPEC_ROOT["$WORKFLOW_NAME"]:-}"
+if [[ -z "$SPEC_ROOT" ]]; then
+  # Fallback: infer from config file name
+  if [[ "$CONFIG_FILE" == *"msp"* ]]; then
+    SPEC_ROOT="cypress/sanity-test/e2e-msp"
+  elif [[ "$CONFIG_FILE" == *"smoke"* ]]; then
+    SPEC_ROOT="cypress/smoke-test/e2e"
+  elif [[ "$CONFIG_FILE" == *"flanders"* ]]; then
+    SPEC_ROOT="cypress/sanity-test/e2e-flanders"
+  else
+    SPEC_ROOT="cypress/sanity-test/e2e"
+  fi
+fi
+
+# ── fetch all job IDs for the run ─────────────────────────────────────────────
+echo "📡 Fetching jobs for run $RUN_ID..."
+JOB_IDS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+  --jq '.jobs[] | select(.name | startswith("cypress-run")) | .id' 2>/dev/null)
+
+if [[ -z "$JOB_IDS" ]]; then
+  echo "❌ No cypress-run jobs found for run $RUN_ID" >&2
+  exit 1
+fi
+
+# ── extract failed specs from all job logs ────────────────────────────────────
+echo "📜 Scanning logs for failed specs..."
+declare -A SEEN_SPECS
+FAILED_SPECS=()
+
+while IFS= read -r JOB_ID; do
+  JOB_LOGS=$(gh api "repos/${REPO}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)
+
+  # Cypress summary table marks failed specs with ✖
+  # CI logs contain ANSI color codes - strip them first, then extract spec names
+  # Line format (after stripping): │ ✖  path/to/spec.cy.ts   time   tests  pass  fail ...
+  while IFS= read -r LINE; do
+    # Strip ANSI escape codes, then extract spec path after ✖
+    SPEC=$(echo "$LINE" \
+      | sed 's/\x1b\[[0-9;]*m//g' \
+      | sed -n 's/.*✖[[:space:]]\{1,\}\([^[:space:]]*\.cy\.ts\).*/\1/p' || true)
+    if [[ -n "$SPEC" && -z "${SEEN_SPECS[$SPEC]+_}" ]]; then
+      SEEN_SPECS[$SPEC]=1
+      FAILED_SPECS+=("${SPEC_ROOT}/${SPEC}")
+    fi
+  done <<< "$(echo "$JOB_LOGS" | grep '✖' | grep '\.cy\.ts')"
+done <<< "$JOB_IDS"
+
+# ── report results ────────────────────────────────────────────────────────────
+if [[ ${#FAILED_SPECS[@]} -eq 0 ]]; then
+  echo "✅ No failed specs found in run $RUN_ID. Nothing to re-run."
+  exit 0
+fi
+
+echo ""
+echo "❌ Found ${#FAILED_SPECS[@]} failed spec(s):"
+for SPEC in "${FAILED_SPECS[@]}"; do
+  echo "   • $SPEC"
+done
+echo ""
+
+# ── build --spec argument ─────────────────────────────────────────────────────
+# Use zsh array join: ${(j:,:)array} joins elements with a comma — no IFS tricks needed
+SPEC_ARG="${(j:,:)FAILED_SPECS}"
+
+# ── build command as an array (avoids all eval/quoting issues) ────────────────
+CMD_DISPLAY="npx cypress run --config-file ${CONFIG_FILE} --spec \"${SPEC_ARG}\""
+if [[ -n "$WORKSPACE_ENV" ]]; then
+  CMD_DISPLAY="WORKSPACE=${WORKSPACE_ENV} ${CMD_DISPLAY}"
+fi
+
+echo "🚀 Command to re-run failed tests:"
+echo ""
+echo "   $CMD_DISPLAY"
+echo ""
+
+# ── execute ───────────────────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == true ]]; then
+  echo "🔍 Dry run - command printed above, not executed."
+  exit 0
+fi
+
+cd "$PROJECT_ROOT"
+
+echo "▶️  Running in: $PROJECT_ROOT"
+echo "────────────────────────────────────────────────────────"
+
+# Build as a real array so no eval/re-quoting occurs.
+# --spec receives exactly one value: "path1,path2,path3" — which is what Cypress expects.
+local -a RUN_CMD=(npx cypress run --config-file "${CONFIG_FILE}" --spec "${SPEC_ARG}")
+
+if [[ -n "$WORKSPACE_ENV" ]]; then
+  WORKSPACE="${WORKSPACE_ENV}" "${RUN_CMD[@]}"
+else
+  "${RUN_CMD[@]}"
+fi
+
