@@ -169,6 +169,35 @@ echo "📜 Scanning logs for failed specs..."
 declare -A SEEN_SPECS
 FAILED_SPECS=()
 
+# resolve_spec: find the real path under SPEC_ROOT for a (possibly truncated) log path.
+# Cypress strips the longest common prefix from spec paths in the summary table,
+# so "enrollment/partner/v17/eligibility.cy.ts" may appear as "partner/v17/eligibility.cy.ts".
+# We use `find` to locate the actual file under the spec root, matching on the filename
+# and then checking if the full path ends with the log path.
+resolve_spec() {
+  local log_path="$1"
+  local full_root="${PROJECT_ROOT}/${SPEC_ROOT}"
+  local filename="${log_path##*/}"
+
+  # First try the path as-is
+  if [[ -f "${full_root}/${log_path}" ]]; then
+    echo "${SPEC_ROOT}/${log_path}"
+    return
+  fi
+
+  # Search for a file whose path ends with log_path under the spec root
+  while IFS= read -r candidate; do
+    local rel="${candidate#${full_root}/}"
+    if [[ "$rel" == *"${log_path}" ]]; then
+      echo "${SPEC_ROOT}/${rel}"
+      return
+    fi
+  done < <(find "$full_root" -name "$filename" -type f 2>/dev/null)
+
+  # Fallback: return original (will fail to find spec, but preserves old behaviour)
+  echo "${SPEC_ROOT}/${log_path}"
+}
+
 while IFS= read -r JOB_ID; do
   JOB_LOGS=$(gh api "repos/${REPO}/actions/jobs/${JOB_ID}/logs" 2>/dev/null || true)
 
@@ -182,7 +211,8 @@ while IFS= read -r JOB_ID; do
       | sed -n 's/.*✖[[:space:]]\{1,\}\([^[:space:]]*\.cy\.ts\).*/\1/p' || true)
     if [[ -n "$SPEC" && -z "${SEEN_SPECS[$SPEC]+_}" ]]; then
       SEEN_SPECS[$SPEC]=1
-      FAILED_SPECS+=("${SPEC_ROOT}/${SPEC}")
+      RESOLVED=$(resolve_spec "$SPEC")
+      FAILED_SPECS+=("$RESOLVED")
     fi
   done <<< "$(echo "$JOB_LOGS" | grep '✖' | grep '\.cy\.ts')"
 done <<< "$JOB_IDS"
